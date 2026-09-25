@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 
+import requests
 from dotenv import load_dotenv
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -36,7 +37,16 @@ def env_list(name: str) -> set[str]:
     return {value.strip().lower() for value in os.getenv(name, "").split(",") if value.strip()}
 
 
+def materialize_json_secret(path: Path, env_name: str) -> None:
+    value = os.getenv(env_name, "").strip()
+    if value:
+        path.write_text(value, encoding="utf-8")
+
+
 def authenticate(force_login: bool = False) -> Credentials:
+    materialize_json_secret(TOKEN_PATH, "GOOGLE_TOKEN_JSON")
+    materialize_json_secret(CREDENTIALS_PATH, "GOOGLE_CREDENTIALS_JSON")
+
     credentials = None
     if TOKEN_PATH.exists() and not force_login:
         credentials = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
@@ -44,8 +54,12 @@ def authenticate(force_login: bool = False) -> Credentials:
         credentials.refresh(Request())
     if not credentials or not credentials.valid:
         if not CREDENTIALS_PATH.exists():
-            raise FileNotFoundError("Download a Desktop OAuth client JSON file as credentials.json first.")
-        flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+            raise FileNotFoundError("Download a Desktop OAuth client JSON file as credentials.json first or set GOOGLE_CREDENTIALS_JSON.")
+        credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+        if credentials_json:
+            flow = InstalledAppFlow.from_client_config(json.loads(credentials_json), SCOPES)
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
         credentials = flow.run_local_server(
             port=0,
             prompt="select_account",
@@ -110,6 +124,110 @@ def reply_body(subject: str) -> str:
             "I have received it and will follow up shortly.")
 
 
+def openai_chat(system_prompt: str, user_prompt: str, max_tokens: int = 300) -> str | None:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.7,
+                "max_tokens": max_tokens,
+            },
+            timeout=45,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        LOGGER.warning("OpenAI request failed: %s", exc)
+        return None
+
+
+def classify_email(subject: str, sender: str, message_text: str) -> str:
+    system_prompt = (
+        "You are an email triage assistant. Classify the email into exactly one of these labels: "
+        "meeting_request, inquiry, follow_up, complaint, newsletter, spam, other. "
+        "Return only the label name."
+    )
+    user_prompt = (
+        f"Sender: {sender}\n"
+        f"Subject: {subject}\n"
+        f"Email body:\n{message_text[:4000]}"
+    )
+    label = openai_chat(system_prompt, user_prompt, max_tokens=50)
+    if not label:
+        return "other"
+    normalized = label.strip().lower().replace(" ", "_")
+    return normalized if normalized in {
+        "meeting_request",
+        "inquiry",
+        "follow_up",
+        "complaint",
+        "newsletter",
+        "spam",
+        "other",
+    } else "other"
+
+
+def summarize_thread(gmail, thread_id: str, current_message_text: str) -> str:
+    if not thread_id:
+        return "No thread context available."
+
+    try:
+        thread = gmail.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    except Exception as exc:
+        LOGGER.warning("Could not fetch thread %s for summarization: %s", thread_id, exc)
+        return "No thread context available."
+
+    messages = []
+    for message in thread.get("messages", [])[:8]:
+        headers = message.get("payload", {}).get("headers", [])
+        sender = header(headers, "From")
+        subject = header(headers, "Subject")
+        body = message_text(message["payload"])
+        snippet = body.strip().replace("\n", " ")
+        messages.append(f"From: {sender}\nSubject: {subject}\nBody: {snippet[:1000]}")
+
+    combined = "\n\n---\n\n".join(messages) or current_message_text[:4000]
+    system_prompt = (
+        "You summarize email threads. Produce a short, accurate summary of the conversation, "
+        "including the key asks, decisions, and any unresolved issues. Keep it concise."
+    )
+    user_prompt = f"Current message:\n{current_message_text[:2000]}\n\nThread context:\n{combined}"
+    summary = openai_chat(system_prompt, user_prompt, max_tokens=200)
+    return summary or "No thread summary available."
+
+
+def llm_reply(subject: str, sender: str, message_text: str, classification: str = "other", thread_summary: str = "") -> str:
+    system_prompt = (
+        "You are a helpful email assistant. Draft a concise, professional, customer-friendly reply. "
+        "Be brief, polite, natural, and avoid making up facts. If the message is unclear, ask for the missing detail. "
+        "Return only the final email reply body."
+    )
+    user_prompt = (
+        f"Classification: {classification}\n"
+        f"Thread summary: {thread_summary or 'No prior thread summary available.'}\n\n"
+        f"Sender: {sender}\n"
+        f"Subject: {subject}\n"
+        f"Email content:\n{message_text[:4000]}"
+    )
+    reply = openai_chat(system_prompt, user_prompt, max_tokens=300)
+    return reply or reply_body(subject)
+
+
 def send_reply(gmail, message: dict, body: str) -> None:
     metadata = message["payload"]["headers"]
     reply = EmailMessage()
@@ -160,7 +278,17 @@ def process_once(gmail, calendar, state: dict) -> None:
             if not dry_run:
                 create_event(calendar, start, title)
         if not dry_run:
-            send_reply(gmail, message, reply_body(subject))
+            classification = classify_email(subject, sender, text)
+            thread_summary = summarize_thread(gmail, message.get("threadId"), text)
+            LOGGER.info("Classified email as: %s", classification)
+            LOGGER.info("Thread summary: %s", thread_summary)
+
+            if classification in {"newsletter", "spam"}:
+                LOGGER.info("Skipping reply for classified email type: %s", classification)
+                continue
+
+            reply_text = llm_reply(subject, sender, text, classification=classification, thread_summary=thread_summary)
+            send_reply(gmail, message, reply_text)
             gmail.users().messages().modify(
                 userId="me", id=message_id, body={"removeLabelIds": ["UNREAD"]}
             ).execute()
