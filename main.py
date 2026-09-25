@@ -39,8 +39,13 @@ def env_list(name: str) -> set[str]:
 
 def materialize_json_secret(path: Path, env_name: str) -> None:
     value = os.getenv(env_name, "").strip()
-    if value:
-        path.write_text(value, encoding="utf-8")
+    if not value:
+        return
+    if (value.startswith("\'") and value.endswith("\'")) or (value.startswith('"') and value.endswith('"')):
+        value = value[1:-1]
+    if value.startswith("```json") and value.endswith("```"):
+        value = value[7:-3].strip()
+    path.write_text(value, encoding="utf-8")
 
 
 def authenticate(force_login: bool = False) -> Credentials:
